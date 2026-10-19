@@ -237,20 +237,52 @@ function rewriteProxiedHtml(html, entry) {
     output = output.split(`"${base}`).join(`"${prefix}${base}`)
     output = output.split(`'${base}`).join(`'${prefix}${base}`)
   }
-  // The Aliyun captcha is an external script. The management CSP blocks it and
-  // QR login does not need it, so drop it rather than widening script-src.
-  output = output.replace(/<script[^>]*o\.alicdn\.com[^>]*>\s*<\/script>/gi, '')
   if (entry.provider === 'raccoon') {
-    output = output.replace('<body>', '<body><div style="margin:0;padding:8px 12px;background:#fff7e6;color:#8a5a00;font-size:12px;text-align:center">远程部署请使用微信扫码登录；短信登录的验证码脚本未加载。</div>')
+    // The local page silently swallows fetch failures; surface an expired
+    // management session instead of leaving the user on "等待扫码…".
+    output = output.replace('<body>', `<body>
+<div style="margin:0;padding:8px 12px;background:#eef6ff;color:#1d4f91;font-size:12px;text-align:center">扫码后请在微信中确认登录；若一直停留在“等待扫码”，可改用短信登录。</div>
+<script>
+(function () {
+  document.addEventListener('securitypolicyviolation', function (event) {
+    var target = document.getElementById('smsStatus');
+    if (!target) return;
+    target.textContent = '验证码组件被 CSP 拦截：' + (event.blockedURI || event.violatedDirective || 'unknown');
+    target.setAttribute('data-tone', 'err');
+  });
+  var original = window.fetch;
+  window.fetch = function (input, init) {
+    return original(input, init).then(function (response) {
+      if (response.status === 401 || response.status === 403) {
+        var targets = [document.getElementById('qrStatus'), document.getElementById('smsStatus')];
+        targets.forEach(function (target) {
+          if (!target) return;
+          target.textContent = '管理会话已失效，请关闭窗口并重新登录';
+          target.setAttribute('data-tone', 'err');
+        });
+      }
+      return response;
+    });
+  };
+})();
+</script>`)
   }
   return output
 }
 
-const LOGIN_PAGE_HEADERS = {
-  'cache-control': 'no-store',
-  'x-content-type-options': 'nosniff',
-  'referrer-policy': 'no-referrer',
-  'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+const LOGIN_PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+// Raccoon's SMS tab loads the Aliyun slider captcha. Its script, API calls and
+// iframe all live on Alibaba's CDNs, so this one proxied page gets a wider CSP
+// than the management console. The QR tab does not need any of it.
+const RACCOON_LOGIN_PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline' https://*.alicdn.com https://o.alicdn.com; script-src 'unsafe-inline' 'unsafe-eval' https://*.alicdn.com https://o.alicdn.com; connect-src 'self' https://*.aliyuncs.com https://*.alicdn.com https://o.alicdn.com; img-src 'self' data: blob: https://*.aliyuncs.com https://*.alicdn.com https://o.alicdn.com; frame-src 'self' blob: https://*.aliyuncs.com https://*.alicdn.com https://o.alicdn.com; font-src 'self' data: https://*.alicdn.com https://o.alicdn.com; worker-src 'self' blob:; form-action 'self' https://*.aliyuncs.com https://*.alicdn.com https://o.alicdn.com; frame-ancestors 'none'; base-uri 'none'"
+
+function loginPageHeaders(provider) {
+  return {
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
+    'content-security-policy': provider === 'raccoon' ? RACCOON_LOGIN_PAGE_CSP : LOGIN_PAGE_CSP,
+  }
 }
 
 async function readBody(req, limit = MAX_BODY_BYTES) {
@@ -510,7 +542,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
     } else if (method === 'GET' && pathname.startsWith(`${PREFIX}/login/manual/`)) {
       const entry = findRemoteLogin(pathname.slice(`${PREFIX}/login/manual/`.length))
       if (entry === undefined || entry.kind !== 'callback') throw fail(404, '授权会话不存在或已过期')
-      res.writeHead(200, { ...LOGIN_PAGE_HEADERS, 'content-type': 'text/html; charset=utf-8' })
+      res.writeHead(200, { ...loginPageHeaders(entry.provider), 'content-type': 'text/html; charset=utf-8' })
       res.end(renderManualLoginPage(entry))
     } else if (pathname.startsWith(`${PREFIX}/login/page/`)) {
       const rest = pathname.slice(`${PREFIX}/login/page/`.length)
@@ -550,7 +582,7 @@ export function createManagement({ stores, runtime, channels, eac, info, onSetti
         request.end(body)
       }).catch(() => { throw fail(502, '无法连接本机登录页，授权可能已超时') })
       if (upstream.type.toLowerCase().includes('text/html')) {
-        res.writeHead(upstream.status, { ...LOGIN_PAGE_HEADERS, 'content-type': 'text/html; charset=utf-8' })
+        res.writeHead(upstream.status, { ...loginPageHeaders(entry.provider), 'content-type': 'text/html; charset=utf-8' })
         res.end(rewriteProxiedHtml(upstream.body.toString('utf8'), entry))
       } else {
         res.writeHead(upstream.status, {
